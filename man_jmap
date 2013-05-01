@@ -1,0 +1,298 @@
+#!/usr/bin/perl
+#
+# man_jmap - a script to automatically heap dump a given pid
+#
+# 2012-02-20  lottca  Created.
+# 2012-02-21  lottca  Added -cdfhvz command-line options.
+# 2012-02-22  lottca  Added comments, fixed typos, etc.
+# 2012-02-23  lottca  Better disk space & file checking semantics.
+# 2012-02-24  lottca  Fixed a bug with parsing split lines in "df" output.
+# 2013-01-31  lottca  Fixed a bug with parsing memory size in "jstat" output.
+# 2013-04-16  clott   Updated for Manheim.
+#
+
+use strict;
+use POSIX qw(uname);
+use Getopt::Long;
+
+# Version information
+our $VERSION_STRING="man_jmap v0.04 2013-04-16\n";
+
+my %options;
+Getopt::Long::Configure ("bundling");
+GetOptions (
+  "check|c",           \$options{'check_only'},
+  "directory|dir|d=s", \$options{'log_dir'},
+  "force|f",           \$options{'force'},
+  "help|h",            \$options{'help'},
+  "version|v",         \$options{'version'},
+  "nogzip|z",          \$options{'no_gzip'},
+);
+
+# Print version/help information if requested
+if ( $options{'help'}    ) { help();    exit 0; }
+if ( $options{'version'} ) { version(); exit 0; }
+
+# Complain and die unless the pid argument is entirely numeric
+my $pid = shift ( @ARGV );
+unless ( $pid =~ m/^\d+$/ ) {
+  warn "ERROR: invalid pid argument!\n";
+  usage();
+  exit 1;
+}
+
+# Get local hostname and start safety checks
+my @errors;                   # contains error text for later display
+my $jps_name;                 # java program name displayed in jps output
+my $MAX_DISK_PCT_USED  = 2/3; # i.e., two-thirds of available space
+my $DEFAULT_OUTPUT_DIR = $ENV{'HOME'} . '/log';  # "$HOME/log"
+
+# Get hostname via POSIX function and strip any trailing domain name
+my ( $UNIXNAME, $LOCALHOST, $RELEASE, $VERSION, $MACHINE ) = POSIX::uname();
+my ( $localhost, undef ) = split ( /\./, $LOCALHOST );
+
+print _logstamp() . "START: performing safety checks for heap dump of pid $pid on $localhost.\n";
+
+# Open jps and attempt to parse the pid argument from output
+open ( my $jps, "-|", "jps 2>/dev/null" ) || warn _logstamp() . "WARNING: could not open jps to verify java pid: $!\n";
+JPS_LINE: while ( <$jps> ) {
+  chomp();
+  s/^\s+//;
+  my ( $jps_pid, $name ) = split ( /\s+/, $_ );
+  if ( $jps_pid == $pid ) {
+    $jps_name = $name;
+    last JPS_LINE;
+  }
+}
+close ( $jps );
+
+# We should have a defined value for $jps_name if we matched the pid in jps
+if ( $jps_name ) {
+  print _logstamp() . "Verified that pid $pid is a Java process.\n";
+}
+else {  # Otherwise complain
+  push ( @errors, _logstamp() . "ERROR: Could not verify that pid $pid is a java process!.\n" );
+  push ( @errors, _logstamp() . "Please double-check that pid is correct and process is owned by the current userid.\n" );
+}
+
+# Use default value for output directory if not specified by the user
+my $log_dir = $options{'log_dir'} || $DEFAULT_OUTPUT_DIR;
+
+# Now we create the directory (in case it doesn't already exist)
+mkdir $log_dir;
+
+# Complain unless the directory actually exists
+unless ( -d $log_dir ) {
+  push ( @errors, _logstamp() . "ERROR: Could not verify that $log_dir is a usable directory! Please double-check path name.\n" );
+}
+
+# Now we start building the jmap command line
+my $datestamp = _datestamp();  # YYYYMMDD-HHMMSS format
+my $output_file = $log_dir . join ( '.', '/jmap', $localhost, $datestamp, lc($jps_name), $pid, 'bin' );
+
+# Output file sanity checks
+# Complain if the file already exists
+if ( -f $output_file ) {
+  push ( @errors, _logstamp() . "ERROR: file $output_file already exists! Please remove/rename it.\n");
+}
+# also complain if the file is not writeable
+else {
+  open ( my $test_fh, ">>", $output_file ) || push ( @errors, _logstamp() . "ERROR: Couldn't open $output_file for write : $!\n" );
+  close( $test_fh );
+  unlink $output_file;  # We have to remove the test file because jmap will not overwrite it
+}
+
+# Build actual jmap command line with validated pid and output file name
+my $jmap_cmd = 'jmap -dump:format=b,file=' . $output_file . ' ' . $pid;
+
+# Now we check to make sure sufficient disk space exists
+my $dump_size = parse_jstat( $pid );    # use jstat to compute max heap size
+my $free_space = parse_df( $log_dir );  # use df to determine available space
+
+# Complain if estimated dump size will exceed safety margin
+if ( $dump_size > ( $free_space * $MAX_DISK_PCT_USED ) && $free_space =~ m/^\d+$/ ) {
+  push ( @errors, _logstamp() . "ERROR: Free space on device is below safety margin -- cannot perform heap dump!\n" );
+  push ( @errors, _logstamp() . "  Maximum heap size for pid $pid is " . _commafy( int( $dump_size + 0.5 ) ) . " kbytes.\n" );
+  push ( @errors, _logstamp() . "  By default, I require a minimum of " . _commafy( int( $dump_size / $MAX_DISK_PCT_USED ) ). " kbytes free space to proceed.\n" );
+  push ( @errors, _logstamp() . "  Free space on $log_dir partition is currently " . _commafy($free_space) . " kbytes.\n" );
+}
+else {
+  print _logstamp() . "Estimated uncompressed dump size is " . _commafy( int( $dump_size + 0.5 ) ) . " kbytes; " . _commafy($free_space) . " kbytes available.\n";
+}
+
+# If we have errors, complain and die unless --force option is set
+if ( @errors ) {
+  warn @errors;
+  if ( $options{'check_only'} ) {
+    warn _logstamp() . "FAIL: At least one safety check failed; execution will not proceed without --force option.\n";
+    exit 1;
+  }
+  if ( $options{'force'} ) {
+    warn _logstamp() . "WARNING: At least one safety check failed; proceeding due to --force option.\n";
+  }
+  else {
+    warn _logstamp() . "If you wish to override safety checks, please re-run with the --force option.\n";
+    warn _logstamp() . "FINISH: No actions taken.\n";
+    exit 1;
+  }
+}
+
+# If --check option is in effect, then stop here before actually running dump
+if ( $options{'check_only'} ) {
+  print _logstamp() . "SUCCESS: All safety checks succeeded.\n";
+  exit 0;
+}
+
+# For heaps over a gigabtye in size, ask the user to be patient
+if ( $dump_size > 1000 ) {
+  print _logstamp() . "Please be patient -- larger heap sizes can take a few minutes to dump to disk.\n";
+  print _logstamp() . "You can check progress by periodically running an \"ls -l $output_file\" in a separate window.\n";
+  print _logstamp() . "If the dump is working, then the output file size should keep increasing in size.\n";
+}
+
+# Now we finally run the actual dump commmand
+print _logstamp() . "Running: $jmap_cmd\n";
+my $status = system($jmap_cmd);
+
+# If jmap returns a good status, then gzip output file as requested
+if ( $status == 0 ) {
+  # Fire off a background gzip unless no_gzip option is set
+  if ( $options{'no_gzip'} ) {
+    print _logstamp() . "Dump complete. Output file located at:\n";
+    print _logstamp() . $output_file . "\n";
+  }
+  else {
+    print _logstamp() . "FINISH: Dump complete. Once background gzip completes, output file will be located at:\n";
+    print _logstamp() . $output_file . ".gz\n";
+    system("nohup gzip $output_file >/dev/null 2>&1 &");
+  }
+  # End script
+  exit 0;
+}
+
+# Otherwise complain and die
+die _logstamp() . "ERROR: \"jmap\" returned non-zero status: \"$!\"\n";
+
+##
+## Everything following this line is a function
+##
+
+# Gets the heap size of a pid via "jstat"
+sub parse_jstat {
+  my $pid = shift ( @_ ) || return undef;
+  my $heap_size_in_kbytes;
+  open ( my $jstat, "-|", "jstat -gc $pid" ) || warn "ERROR: could not open jstat: $!\n";
+  my $discard = <$jstat>;  # discard header line
+  while ( <$jstat> ) {
+    s/^\s+//;  # strip any leading whitespace
+    s/\s+$//;  # strip any trailing whitespace (including newline)
+    # These odd variable names correspond to column headers in "jstat -gc" output
+    my ( $s0c, $s1c, $s0u, $s1u, $ec, $eu, $oc, $ou, $pc, $pu, $ygc, $ygct, $fgc, $fgct, $gct ) = split ( /\s+/, $_ );
+    # Total heap size is sum of both surivor spaces, plus eden, old, and perm spaces
+    $heap_size_in_kbytes = ( $s0u + $s1u + $eu + $ou + $pu );
+  }
+  close ( $jstat );
+  return scalar $heap_size_in_kbytes;
+}
+
+# Gets the free space of a disk partition via "df"
+sub parse_df {
+  my $dir = shift ( @_ ) || return undef;
+  my $disk_free_in_kbytes;
+  open ( my $df, "-|", "df -k $dir 2>&1" ) || warn "ERROR: could not open jstat: $!\n";
+  my $discard = <$df>;  # discard header line
+  while ( <$df> ) {
+    s/^\s+//;  # strip any leading whitespace
+    s/\s+$//;  # strip any trailing whitespace (including newline)
+    #
+    # Sadly, df puts in a linebreak if the filesystem field is sufficiently long.
+    # This means a simple static parse like the following line won't work:
+    #   my ( $filesystem, $blocks, $used, $available, $use_pct, $mount_point ) = split ( /\s+/, $_ );
+    # So instead we chunk the line data into an array and grab the third field from the end.
+    # 
+    my @chunks = split ( /\s+/, $_ );       # split line by whitespace
+    my $i = scalar ( @chunks ) - 3;         # compute array index of third chunk from the end
+    my $available = @chunks[$i];            # grab the text in that chunk
+    next unless ( $available =~ m/^\d+$/);  # discard if the text is not entirely numeric
+    $disk_free_in_kbytes = $available;      # otherwise use it as our value
+    last;                                   # and stop looping through the output
+  }
+  close ( $df );
+  return scalar $disk_free_in_kbytes || return scalar '(null)';
+}
+
+# Commafy a number. Perl Cookbook, 2.17, p. 64
+sub _commafy {
+  my $text = reverse $_[0];
+  $text =~ s/(\d\d\d)(?=\d)(?!\d*\.)/$1,/g;
+  return scalar reverse $text;
+}
+
+# Returns current time in a six-element array of YYYYY MM DD HH MM SS
+sub _time {
+  my ( $sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst ) = localtime( time() );
+  $year += 1900;
+  $mon += 1;
+  ( $sec, $min, $hour, $day, $mon ) = map { sprintf "%02d", $_ } ( $sec, $min, $hour, $day, $mon );
+  return ( $year, $mon, $day, $hour, $min, $sec );
+}
+
+# Returns [YYYYMMDD-HH:MM:SS] string for current time
+sub _logstamp {
+  my ( $year, $mon, $day, $hour, $min, $sec ) =  _time();
+  return scalar ( '[' . join ( '', $year, $mon, $day ) . '-' . join ( ':', $hour, $min, $sec ) . '] ') ;
+}
+
+# Returns YYYYMMDD-HHMMSS string for current time
+sub _datestamp {
+  my ( $year, $mon, $day, $hour, $min, $sec ) =  _time();
+  return scalar ( join ( '', $year, $mon, $day ) . '-' . join ( '', $hour, $min, $sec ) );
+}
+
+# Print usage message
+sub usage {
+  my $usage = <<END;
+
+ihg_jmap - Perform a standard IHG heap dump on a given pid
+
+Usage: ihg_jmap [-cfz] [-d=/path/to/dir] <java pid>
+
+This utility will heap dump a given pid using the "jmap -dump:format=b"
+command to a datestamped output file. It performs various safety checks before
+attempting the dump, including verification of the following:
+
+  -1) The pid argument is a java process listed in "jps" output.
+  -2) The dump file will use no more than two-thirds of available disk space.
+  -3) The output directory exists and the output file is writeable.
+
+You can override all checks with the -f option. (See below.)
+
+The default path for the datestamped output file is as follows:
+
+  \$HOME/log/jmap.HOSTNAME.YYYYMMDD-HHMMSS.JPS_NAME.PID.bin
+
+You can override the default output directory with the -d option. (See below.)
+
+Options:
+--check, -c                          Run checks only; do not perform heap dump.
+--dir, --directory, -d /path/to/dir  Use specified directory for output file.
+--force, -f                          Perform dump regardless of safety checks.
+--nogzip, -z                         Do not compress output file.
+
+Other Options:
+--help, -h                           Print this message and exit.
+--version, -v                        Print version string and exit.
+
+END
+  print $usage;
+}
+
+# Print version string
+sub version {
+  print $VERSION_STRING;
+}
+
+# Print help message
+sub help {
+  version (); usage();
+}
