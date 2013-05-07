@@ -43,7 +43,7 @@ function usage {
 
 $SCRIPT_NAME - run a set of standard diagnostic commands
 
-Usage: $SCRIPT_NAME [-l logfile] [-jz] [-hv] <pid1> <pid2> ... <pidN>
+Usage: $SCRIPT_NAME [ -d dir ] [-l file] [-jz] [-hv] <pid1> <pid2> ... <pidN>
 
 This script runs several diagnostic commands on the local system and saves the
 output to a gzipped log file. You may also specify an optional list of pids,
@@ -60,6 +60,7 @@ below.)
 
 
 Options:
+-d            Use specified output directory instead of default
 -j            Also process any pids listed in output of "jps" command.
 -l <logfile>  Use specified log file instead of default.
 -z            Do not gzip log file.
@@ -83,9 +84,12 @@ function help {
 }
 
 # Command line options processing.
-while getopts "hjl:vz" OPTION
+while getopts "d:hjl:vz" OPTION
 do
   case $OPTION in
+    d)
+      DEFAULT_OUTPUT_DIR=$OPTARG
+    ;;
     h)
       help
       exit 0
