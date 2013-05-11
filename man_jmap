@@ -16,7 +16,7 @@ use POSIX qw(uname);
 use Getopt::Long;
 
 # Version information
-our $VERSION_STRING="man_jmap v0.04 2013-04-16\n";
+my $VERSION_STRING="man_jmap v0.04 2013-04-16\n";
 
 my %options;
 Getopt::Long::Configure ("bundling");
@@ -253,7 +253,7 @@ sub _datestamp {
 sub usage {
   my $usage = <<END;
 
-ihg_jmap - Perform a standard IHG heap dump on a given pid
+ihg_jmap - Perform a standard heap dump on a given pid
 
 Usage: ihg_jmap [-cfz] [-d=/path/to/dir] <java pid>
 
